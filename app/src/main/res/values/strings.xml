@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PictoChat</string>
+    <string name="create_room">Create Room</string>
+    <string name="discover_rooms">Discover Rooms</string>
+    <string name="join_room">Join Room</string>
+    <string name="your_name">Your name</string>
+    <string name="enter_nickname">Enter your nickname</string>
+    <string name="typing_hint">Type a message...</string>
+    <string name="send">Send</string>
+    <string name="take_photo">Take Photo</string>
+    <string name="photo_from_gallery">Photo from Gallery</string>
+    <string name="leave_room">Leave Room</string>
+    <string name="no_messages_yet">No messages yet</string>
+    <string name="start_chatting_hint">Send a message to start the chat!</string>
+    <string name="wifi_direct_unavailable">Wi-Fi Direct unavailable</string>
+    <string name="room_created">Room created — others can now discover and join</string>
+    <string name="joined_room">Joined room successfully</string>
+    <string name="connection_error">Connection error</string>
+    <string name="permissions_required">Permissions required for Wi-Fi Direct</string>
+</resources>
