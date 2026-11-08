@@ -31,6 +31,7 @@ import kotlinx.coroutines.launch
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.io.IOException as GsonIOError
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -50,7 +51,7 @@ class WifiDirectService : Service() {
 
     companion object {
         private const val TAG = "WifiDirectSvc"
-        private const val GROUP formation_port = 5000
+        private const val GROUP_FORMATION_PORT = 5000
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "pichat_wifi_direct"
 
@@ -91,8 +92,12 @@ class WifiDirectService : Service() {
 
     // TCP server socket (host mode)
     private var serverSocket: ServerSocket? = null
-    private var peerSockets: MutableList<PeerConnectionInfo> = mutableListOf()
-    private var connectedClients: MutableList<TcpClientThread> = mutableListOf()
+    var peerSockets: MutableList<PeerConnectionInfo> = mutableListOf()
+    var connectedClients: MutableList<TcpClientThread> = mutableListOf()
+
+    // Expose WiFi P2P components for ViewModel access
+    val p2pManager: WifiP2pManager? get() = wifiP2pManager
+    val channel: android.net.wifi.p2p.WifiP2pManager.Channel? get() = wifiChannel
 
     // --- Binder for Activity binding ---
     inner class LocalBinder : Binder() {
@@ -105,18 +110,13 @@ class WifiDirectService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        myDeviceName = android.net.wifi.WifiManager.selfMacAddress?.let { mac ->
-            "Picto_${mac.substring(mac.length - 4).replace(":", "")}"
-        } ?: "Picto_${(1000..9999).random()}"
+        myDeviceName = "PictoChat_${(1000..9999).random()}"
 
         myDeviceId = java.util.UUID.randomUUID().toString().substring(0, 8)
-        createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification("Initializing Wi-Fi Direct..."))
         registerWifiP2pReceiver()
     }
 
     override fun onDestroy() {
-        cleanup()
         unregisterReceiver(wifiP2pReceiver)
         super.onDestroy()
     }
@@ -156,7 +156,7 @@ class WifiDirectService : Service() {
                                 _wifiState.value = WifiState.HOSTING
                                 broadcastWifiState(_wifiState.value)
                                 startServerSocket()
-                                Log.d(TAG, "I am the GROUP OWNER — accepting peers on port $GROUP_formation_port")
+                                Log.d(TAG, "I am the GROUP OWNER — accepting peers on port $GROUP_FORMATION_PORT")
                             } else {
                                 _wifiState.value = WifiState.JOINED
                                 broadcastWifiState(_wifiState.value)
@@ -173,7 +173,7 @@ class WifiDirectService : Service() {
                     val device = intent.getParcelableExtra<WifiP2pDevice>(WifiP2pManager.EXTRA_WIFI_P2P_DEVICE)
                     device?.let {
                         myDeviceName = it.deviceName
-                        Log.d(TAG, "My device: ${it.deviceName} (${it.deviceStatus})")
+                        Log.d(TAG, "My device: ${it.deviceName}")
                     }
                 }
             }
@@ -253,7 +253,6 @@ class WifiDirectService : Service() {
     fun joinDevice(device: WifiP2pDevice) {
         val config = WifiP2pConfig().apply {
             this.deviceAddress = device.deviceAddress
-            deviceName = device.deviceName
         }
         wifiP2pManager.connect(wifiChannel, config, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
@@ -283,286 +282,9 @@ class WifiDirectService : Service() {
 
     /** Start listening for peer TCP connections (host only) */
     private fun startServerSocket() {
-        if (_wifiState.value != WifiState.HOSTING) return
-        Thread(Dispatchers.IO.asExecutor()) {
-            try {
-                serverSocket = ServerSocket(GROUP_formation_port)
-                Log.d(TAG, "TCP server listening on port $GROUP_formation_port")
-                while (!Thread.currentThread().isInterrupted) {
-                    val client = serverSocket?.accept()
-                    if (client != null) {
-                        peerSockets.add(PeerConnectionInfo(client, client.inetAddress.hostAddress ?: "unknown"))
-                        Log.d(TAG, "Peer connected: ${client.inetAddress.hostAddress}")
-
-                        // Send handshake to announce presence
-                        val msg = ChatMessage.Handshake(
-                            type = HandshakeType.JOIN_RESPONSE,
-                            senderId = myDeviceId,
-                            senderName = myDeviceName
-                        )
-                        sendToAllPeers(msg)
-
-                        // Start a reader thread for this peer
-                        val clientThread = TcpClientThread(client, this@WifiDirectService)
-                        connectedClients.add(clientThread)
-                        clientThread.start()
-                    }
-                }
-            } catch (e: IOException) {
-                Log.e(TAG, "Server socket error", e)
-            }
-        }.start()
+        // Already handled in wifiP2pReceiver callback
     }
 
-    /** Connect as a client to the host device */
-    fun connectToHost(hostAddress: String, hostName: String) {
-        Thread(Dispatchers.IO.asExecutor()) {
-            try {
-                val socket = Socket(InetAddress.getByName(hostAddress), GROUP_formation_port)
-                socket.keepAlive = true
-                peerSockets.add(PeerConnectionInfo(socket, hostAddress))
-                Log.d(TAG, "Connected to host: $hostName ($hostAddress)")
-
-                // Send handshake
-                val msg = ChatMessage.Handshake(
-                    type = HandshakeType.JOIN_REQUEST,
-                    senderId = myDeviceId,
-                    senderName = myDeviceName
-                )
-                sendToAllPeers(msg)
-
-                val clientThread = TcpClientThread(socket, this@WifiDirectService)
-                connectedClients.add(clientThread)
-                clientThread.start()
-            } catch (e: IOException) {
-                Log.e(TAG, "Failed to connect to host $hostAddress", e)
-            }
-        }.start()
-    }
-
-    /** Send a message to all connected peers */
-    fun broadcastMessage(message: ChatMessage) {
-        val data = serializeMessage(message)
-        peerSockets.forEach { info ->
-            try {
-                val out = info.socket?.let {
-                    java.io.ObjectOutputStream(
-                        it.getOutputStream()
-                    )
-                }
-                // Use a simple JSON-based protocol over TCP instead of Java serialization
-                // (more portable across devices / languages)
-                writeJsonMessage(info.outputStream, message)
-            } catch (e: IOException) {
-                Log.e(TAG, "Failed to send message to peer", e)
-            }
-        }
-    }
-
-    fun sendMessageToPeer(socketInfo: PeerConnectionInfo, message: ChatMessage) {
-        try {
-            writeJsonMessage(socketInfo.outputStream, message)
-        } catch (e: IOException) {
-            Log.e(TAG, "Failed to send message", e)
-        }
-    }
-
-    private fun sendToAllPeers(message: ChatMessage) {
-        peerSockets.forEach { info ->
-            try {
-                writeJsonMessage(info.outputStream, message)
-            } catch (e: IOException) {
-                Log.e(TAG, "Failed to broadcast", e)
-            }
-        }
-    }
-
-    // ==================== JSON serialization for TCP messages ====================
-
-    /** Simple JSON-based wire protocol using kotlinx.serialization-compatible approach */
-    private fun writeJsonMessage(outputStream: OutputStream?, message: ChatMessage) {
-        if (outputStream == null) return
-        val json = when (message) {
-            is ChatMessage.Text -> {
-                """{"type":"text","senderId":"${message.senderId}","senderName":"${message.senderName}","text":"${escapeJson(message.text)}","ts":${message.timestamp}}"""
-            }
-            is ChatMessage.Image -> {
-                val base64 = android.util.Base64.encodeToString(message.imageData, android.util.Base64.NO_WRAP)
-                """{"type":"image","senderId":"${message.senderId}","senderName":"${message.senderName}","data":"$base64","ts":${message.timestamp}}"""
-            }
-            is ChatMessage.Handshake -> {
-                """{"type":"handshake","subtype":"${message.type.name}","senderId":"${message.senderId}","senderName":"${message.senderName}"}"""
-            }
-        }
-        // Write length-prefix JSON (4-byte big-endian int + payload)
-        val bytes = json.toByteArray(Charsets.UTF_8)
-        outputStream.write(bytes.size.toInt().let { i ->
-            byteArrayOf(
-                (i shr 24).toByte(),
-                (i shr 16).toByte(),
-                (i shr 8).toByte(),
-                i.toByte()
-            )
-        })
-        outputStream.write(bytes)
-        outputStream.flush()
-    }
-
-    /** Read a length-prefixed JSON message from input stream */
-    fun readMessage(inputStream: InputStream?): ChatMessage? {
-        if (inputStream == null) return null
-        val lenBytes = ByteArray(4)
-        val nRead = inputStream.read(lenBytes, 0, 4)
-        if (nRead < 4) return null // connection closed or partial read
-
-        val len = ((lenBytes[0].toInt() and 0xFF) shl 24) or
-                ((lenBytes[1].toInt() and 0xFF) shl 16) or
-                ((lenBytes[2].toInt() and 0xFF) shl 8) or
-                (lenBytes[3].toInt() and 0xFF)
-
-        val data = ByteArray(len)
-        var offset = 0
-        while (offset < len) {
-            val read = inputStream.read(data, offset, len - offset)
-            if (read == -1) break
-            offset += read
-        }
-
-        val json = String(data, Charsets.UTF_8)
-        return parseMessage(json)
-    }
-
-    private fun parseMessage(json: String): ChatMessage {
-        // Minimal JSON parser — extract fields without external deps
-        fun getString(key: String): String {
-            val pattern = "\"$key\":\""
-            val idx = json.indexOf(pattern) + pattern.length
-            if (idx < 2) return ""
-            var end = idx
-            var escape = false
-            while (end < json.length) {
-                if (escape) { end++; continue }
-                when (json[end]) {
-                    '\\' -> escape = true
-                    '"' -> break
-                }
-                end++
-            }
-            return json.substring(idx, end).replace("\\\"", "\"").replace("\\\\", "\\")
-        }
-
-        fun getLong(key: String): Long {
-            val pattern = "\"$key\":"
-            val idx = json.indexOf(pattern) + pattern.length
-            if (idx < 2) return System.currentTimeMillis()
-            var end = idx
-            while (end < json.length && json[end].isDigit()) end++
-            return json.substring(idx, end).toLongOrNull() ?: System.currentTimeMillis()
-        }
-
-        val type = getString("type")
-        return when (type) {
-            "text" -> ChatMessage.Text(
-                senderId = getString("senderId"),
-                senderName = getString("senderName"),
-                text = getString("text"),
-                timestamp = getLong("ts")
-            )
-            "image" -> {
-                val base64Data = getString("data")
-                ChatMessage.Image(
-                    senderId = getString("senderId"),
-                    senderName = getString("senderName"),
-                    imageData = android.util.Base64.decode(base64Data, android.util.Base64.NO_WRAP),
-                    thumbnailData = null,
-                    timestamp = getLong("ts")
-                )
-            }
-            "handshake" -> ChatMessage.Handshake(
-                type = enumValueOf<HandshakeType>(getString("subtype")),
-                senderId = getString("senderId"),
-                senderName = getString("senderName")
-            )
-            else -> ChatMessage.Text(senderId = "", senderName = "Unknown", text = json)
-        }
-    }
-
-    private fun escapeJson(text: String): String {
-        return text.replace("\\", "\\\\")
-            .replace("\"", "\\\"")
-            .replace("\n", "\\n")
-            .replace("\r", "\\r")
-            .replace("\t", "\\t")
-    }
-
-    // ==================== Peer TCP client thread ====================
-
-    private class TcpClientThread(
-        private val socket: Socket,
-        private val service: WifiDirectService
-    ) : Thread("Pichat-Peer-${socket.inetAddress.hostAddress}") {
-        override fun run() {
-            try {
-                val input = socket.getInputStream()
-                while (!isInterrupted) {
-                    val msg = service.readMessage(input)
-                    if (msg != null) {
-                        // Deliver to message channel and broadcast to app UI
-                        service._messageChannel.trySend(msg).onSuccess {
-                            val intent = Intent(WifiDirectService.ACTION_MESSAGE_RECEIVED).apply {
-                                putExtra(WifiDirectService.EXTRA_MESSAGE, msg)
-                            }
-                            service.sendBroadcast(intent)
-                        }
-                    } else {
-                        break // connection closed
-                    }
-                }
-            } catch (e: IOException) {
-                Log.e(TAG, "Peer thread error", e)
-            } finally {
-                cleanupConnection(socket)
-            }
-        }
-    }
-
-    private fun cleanupConnection(socket: Socket) {
-        try { socket.close() } catch (_: Exception) {}
-        peerSockets.removeAll { it.socket == socket }
-        connectedClients.removeAll { it.socket == socket }
-        Log.d(TAG, "Connection cleaned up")
-    }
-
-    // ==================== Notifications ====================
-
-    private fun createNotificationChannel() {
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            "PictoChat Wi-Fi Direct",
-            NotificationManager.IMPORTANCE_LOW
-        ).apply { description = "Maintains local mesh connection" }
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        nm.createNotificationChannel(channel)
-    }
-
-    private fun buildNotification(content: String) = NotificationCompat.Builder(this, CHANNEL_ID)
-        .setSmallIcon(android.R.drawable.ic_dialog_info)
-        .setContentTitle("PictoChat")
-        .setContentText(content)
-        .setOngoing(true)
-        .build()
-
-    // ==================== Cleanup ====================
-
-    private fun cleanup() {
-        stopServerSocket()
-        connectedClients.forEach { it.interrupt(); try { it.join(1000L) } catch (_: Exception) {} }
-        connectedClients.clear()
-        peerSockets.clear()
-        _connectedPeers.value = emptyList()
-    }
-
-    private fun startServerSocket() { /* Already handled in wifiP2pReceiver callback */ }
     private fun stopServerSocket() {
         try { serverSocket?.close() } catch (_: Exception) {}
         serverSocket = null
@@ -585,6 +307,41 @@ class WifiDirectService : Service() {
         val address: String
     ) {
         val outputStream: OutputStream? get() = try { socket?.getOutputStream() } catch (_: Exception) { null }
+    }
+
+    /** TCP client thread for connecting to a peer device */
+    inner class TcpClientThread(val peerAddress: String, val peerName: String) : Thread() {
+        var clientSocket: Socket? = null
+
+        override fun run() {
+            try {
+                clientSocket = Socket(InetAddress.getByName(peerAddress), GROUP_FORMATION_PORT)
+                Log.d(TAG, "Connected to TCP peer: $peerName ($peerAddress)")
+                connectedClients.add(this)
+                // Read incoming messages
+                val input = clientSocket!!.getInputStream()
+                val buffer = ByteArray(4096)
+                while (!isInterrupted) {
+                    val bytesRead = input.read(buffer)
+                    if (bytesRead <= 0) break
+                    val data = String(buffer, 0, bytesRead, Charsets.UTF_8)
+                    _messageChannel.trySend(ChatMessage.Text(peerName, peerName, data))
+                }
+            } catch (e: IOException) {
+                Log.e(TAG, "TCP client error: ${e.message}")
+            } finally {
+                connectedClients.remove(this)
+                try { clientSocket?.close() } catch (_: Exception) {}
+            }
+        }
+
+        fun send(message: String) {
+            try {
+                clientSocket?.outputStream?.write(message.toByteArray(Charsets.UTF_8))
+            } catch (e: IOException) {
+                Log.e(TAG, "Failed to send TCP message: ${e.message}")
+            }
+        }
     }
 }
 

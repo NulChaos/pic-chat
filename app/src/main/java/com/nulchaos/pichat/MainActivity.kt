@@ -11,20 +11,24 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.runtime.collectAsState
 import androidx.lifecycle.lifecycleScope
 import com.nulchaos.pichat.ui.screens.ChatScreen
 import com.nulchaos.pichat.ui.screens.RoomScreen
 import com.nulchaos.pichat.ui.theme.PictoChatTheme
 import com.nulchaos.pichat.viewmodel.ChatViewModel
-import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
 /**
@@ -34,10 +38,10 @@ import kotlinx.coroutines.launch
 class MainActivity : ComponentActivity() {
 
     private val viewModel: ChatViewModel by viewModels {
-        androidx.lifecycle.viewmodel.compose.viewModelFactory {
-            inject<ChatViewModel>(
-                android.content.Context::class.java to Context::class.java
-            )
+        viewModelFactory {
+            initializer {
+                ChatViewModel(applicationContext)
+            }
         }
     }
 
@@ -53,12 +57,9 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // App state
-    private var isInChat: Boolean = false
-    private var myNameInput: String = ""
-    private var errorMessage: String? = null
-    private val chatMessages = mutableListOf<com.nulchaos.pichat.model.ChatMessage>()
-    private val connectedPeers = mutableListOf<PeerConnection>()
+    // Track service bound state to avoid double-binding
+    private var isServiceBound = false
+    private var wifiSvc: WifiDirectService? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -69,72 +70,93 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             PictoChatTheme {
-                if (isInChat) {
-                    ChatView(
-                        viewModel = viewModel,
-                        onLeaveRoom = ::onLeaveRoom,
-                        onSendMessage = ::onSendMessage,
-                        onSendImage = ::onSendImage,
-                        chatMessages = chatMessages,
-                        connectedPeers = connectedPeers,
-                        myNameInput = myNameInput,
-                        errorMessage = errorMessage,
-                        onClearError = { errorMessage = null },
-                        messageInput = "",
-                        onMessageInputChange = {},
-                        onTakePhoto = ::onTakePhoto
-                    )
-                } else {
-                    RoomView(
-                        viewModel = viewModel,
-                        onNameChange = { myNameInput = it },
-                        onCreateRoom = ::onCreateRoom,
-                        onJoinRoom = ::onJoinDevice,
-                        onStartDiscovery = ::onStartDiscovery,
-                        errorMessage = errorMessage,
-                        onClearError = { errorMessage = null },
-                        onMyNameSet = { myNameInput = it }
-                    )
-                }
-            }
-        }
+                val ctx = androidx.compose.ui.platform.LocalContext.current
+                val chatMessages by viewModel.chatMessages.collectAsState(emptyList())
+                val connectedPeers by viewModel.connectedPeers.collectAsState(emptyList())
+                val discoveredDevices by viewModel.discoveredDevices.collectAsState(emptyList())
+                val wifiState by viewModel.wifiState.collectAsState(WifiState.DISABLED)
+                val myName by viewModel.myName.collectAsState("")
+                val errorMessage by viewModel.errorMessage.collectAsState(null)
 
-        // Observe service state via ViewModel flow
-        lifecycleScope.launch {
-            viewModel.wifiState.collect { state ->
-                when (state) {
-                    WifiState.HOSTING -> {}  // Still in room
-                    WifiState.JOINED -> {}   // Joined another's room
-                    WifiState.DISABLED -> {
-                        Toast.makeText(this@MainActivity, "Wi-Fi Direct disabled", Toast.LENGTH_SHORT).show()
+                // Navigate to chat when a room is created or joined
+                var isInChat by remember { mutableStateOf(false) }
+                
+                // Auto-navigate when viewModel indicates we're in a room
+                androidx.compose.runtime.LaunchedEffect(wifiState) {
+                    if (wifiState == com.nulchaos.pichat.WifiState.HOSTING || 
+                        wifiState == com.nulchaos.pichat.WifiState.JOINED) {
+                        isInChat = true
                     }
-                    else -> {}
                 }
-            }
-        }
 
-        lifecycleScope.launch {
-            viewModel.messageInput.collect { input ->
-                // Could bind to local state if needed
+                when {
+                    isInChat -> {
+                        ChatScreen(
+                            myName = myName,
+                            onLeaveRoom = {
+                                viewModel.leaveRoom()
+                                isInChat = false
+                            },
+                            onSendMessage = { text -> viewModel.setMessageInput(text) },
+                            onSendImage = { data, thumb -> viewModel.sendImageMessage(data, thumb) },
+                            chatMessages = chatMessages,
+                            connectedPeers = connectedPeers,
+                            wifiState = wifiState,
+                            onError = errorMessage,
+                            onClearError = { viewModel.clearError() },
+                            messageInput = "",
+                            onMessageInputChange = {},
+                            onTakePhoto = {}
+                        )
+                    }
+                    else -> {
+                        RoomScreen(
+                            wifiState = wifiState,
+                            discoveredDevices = discoveredDevices,
+                            onNameChange = { name -> viewModel.setMyName(name) },
+                            onCreateRoom = {
+                                if (myName.isBlank()) {
+                                    Toast.makeText(ctx, "Please enter your name", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    viewModel.startWifiService(this)
+                                }
+                            },
+                            onJoinRoom = { device ->
+                                if (myName.isNotBlank()) {
+                                    viewModel.setMyName(myName)
+                                    viewModel.joinDevice(device)
+                                } else {
+                                    Toast.makeText(ctx, "Please enter your name first", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            onStartDiscovery = { viewModel.startDiscovery() },
+                            onError = errorMessage,
+                            onClearError = { viewModel.clearError() },
+                            onMyNameSet = { name -> viewModel.setMyName(name) },
+                            myDisplayName = myName
+                        )
+                    }
+                }
             }
         }
     }
 
     private fun checkPermissions() {
-        val permissions = arrayOf(
+        val basePerms = arrayOf(
             Manifest.permission.ACCESS_WIFI_STATE,
             Manifest.permission.CHANGE_WIFI_STATE,
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.ACCESS_COARSE_LOCATION,
-            Manifest.permission.CAMERA,
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
-                Manifest.permission.BLUETOOTH_SCAN,
-                Manifest.permission.BLUETOOTH_CONNECT
-            } else {
-                Manifest.permission.BLUETOOTH,
-                Manifest.permission.BLUETOOTH_ADMIN
-            }
+            Manifest.permission.CAMERA
         )
+        
+        val extraPerms = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+            arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+        } else {
+            arrayOf(Manifest.permission.BLUETOOTH, Manifest.permission.BLUETOOTH_ADMIN)
+        }
+        
+        val permissions = basePerms + extraPerms
 
         // Check if all granted
         val needed = permissions.filter { checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED }
@@ -146,153 +168,52 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startWifiDirectService() {
-        viewModel.bindService(this)
-        viewModel.initWifiP2pChannel(this)
-        val intent = Intent(this, WifiDirectService::class.java).apply { setPackage(packageName) }
-        try {
-            bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
-        } catch (e: Exception) {
-            e.printStackTrace()
+        val ctx = this
+        if (!isServiceBound) {
+            viewModel.initWifiP2pChannel(ctx)
+            val intent = Intent(ctx, WifiDirectService::class.java).apply { setPackage(packageName) }
+            try {
+                bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+                isServiceBound = true
+            } catch (e: Exception) {
+                e.printStackTrace()
+                viewModel.setError("Failed to start networking service: ${e.message}")
+            }
         }
     }
 
     private val serviceConnection = object : android.content.ServiceConnection {
-        override fun onServiceConnected(name: android.content.ComponentName?, svc: android.os.Binder?) {
-            val wifiSvc = (svc as WifiDirectService.LocalBinder).getService()
+        override fun onServiceConnected(name: android.content.ComponentName?, service: android.os.IBinder?) {
+            val binder = service as? WifiDirectService.LocalBinder
+            if (binder != null) {
+                val wifiSvc = binder.getService()
 
-            // Observe WiFi state
-            lifecycleScope.launch {
-                wifiSvc.wifiState.collect { state ->
-                    when (state) {
-                        WifiState.HOSTING, WifiState.JOINED -> {}
-                        WifiState.ENABLED -> {}
-                        WifiState.DISABLED -> {
-                            errorMessage = "Wi-Fi Direct unavailable"
+                // Observe WiFi state via ViewModel instead
+                lifecycleScope.launch {
+                    wifiSvc.wifiState.collect { state ->
+                        when (state) {
+                            in listOf(WifiState.HOSTING, WifiState.JOINED, WifiState.ENABLED) -> {}
+                            WifiState.DISABLED -> {
+                                viewModel.setError("Wi-Fi Direct unavailable")
+                            }
+                            else -> {}
                         }
-                        else -> {}
                     }
                 }
             }
-
-            // Observe messages via broadcast receiver
-            val filter = IntentFilter(WifiDirectService.ACTION_MESSAGE_RECEIVED).apply {
-                addAction(WifiDirectService.ACTION_PEERS_FOUND)
-                addAction(WifiDirectService.ACTION_PEER_CONNECTED)
-                addAction(WifiDirectService.ACTION_PEER_DISCONNECTED)
-            }
-            registerReceiver(object : android.content.BroadcastReceiver() {
-                override fun onReceive(ctx: Context?, intent: Intent?) {
-                    when (intent?.action) {
-                        WifiDirectService.ACTION_MESSAGE_RECEIVED -> {
-                            val msg = intent.getParcelableExtra<com.nulchaos.pichat.model.ChatMessage>(WifiDirectService.EXTRA_MESSAGE)
-                            if (msg != null && isInChat) {
-                                chatMessages.add(msg)
-                            }
-                        }
-                        WifiDirectService.ACTION_PEERS_FOUND -> {
-                            // Refreshed via ViewModel
-                        }
-                        WifiDirectService.ACTION_PEER_CONNECTED -> {
-                            val name = intent.getStringExtra(WifiDirectService.EXTRA_PEER_NAME) ?: "Unknown"
-                            connectedPeers.add(PeerConnection(name, "local", true))
-                        }
-                        WifiDirectService.ACTION_PEER_DISCONNECTED -> {
-                            val name = intent.getStringExtra(WifiDirectService.EXTRA_PEER_NAME)
-                            if (name != null) {
-                                connectedPeers.removeAll { it.peerName == name }
-                            }
-                        }
-                    }
-                }
-            }, filter)
         }
 
         override fun onServiceDisconnected(name: android.content.ComponentName?) {
             Toast.makeText(this@MainActivity, "Networking service disconnected", Toast.LENGTH_SHORT).show()
+            viewModel.setError("Networking service disconnected")
         }
-    }
-
-    // --- Actions ---
-
-    private fun onCreateRoom() {
-        if (myNameInput.isBlank()) {
-            errorMessage = "Please enter your name"
-            return
-        }
-        viewModel.setMyName(myNameInput)
-        startWifiDirectService()
-        viewModel.createRoom()
-        isInChat = true
-        chatMessages.clear()
-        connectedPeers.clear()
-    }
-
-    private fun onJoinDevice(device: WifiP2pDevice) {
-        if (myNameInput.isBlank()) {
-            errorMessage = "Please enter your name first"
-            return
-        }
-        viewModel.setMyName(myNameInput)
-        startWifiDirectService()
-        viewModel.joinDevice(device)
-        isInChat = true
-        chatMessages.clear()
-        connectedPeers.clear()
-
-        // Connect to host on port 5000
-        val serviceInfo = android.net.wifi.p2p.WifiP2pDnsSdServiceInfo.newInstance(
-            "_pichat",
-            "_tcp",
-            null
-        )
-        Toast.makeText(this, "Connecting to ${device.deviceName}...", Toast.LENGTH_SHORT).show()
-    }
-
-    private fun onLeaveRoom() {
-        viewModel.leaveRoom()
-        isInChat = false
-        chatMessages.clear()
-        connectedPeers.clear()
-    }
-
-    private fun onSendMessage(text: String) {
-        if (text.isNotBlank()) {
-            // Message sent via ViewModel's sendTextMessage or direct
-            val msg = com.nulchaos.pichat.model.ChatMessage.Text(
-                senderId = viewModel.myName.value,
-                senderName = myNameInput,
-                text = text,
-                timestamp = System.currentTimeMillis()
-            )
-            chatMessages.add(msg)
-        }
-    }
-
-    private fun onSendImage(imageData: ByteArray, thumbnailData: ByteArray?) {
-        val msg = com.nulchaos.pichat.model.ChatMessage.Image(
-            senderId = viewModel.myName.value,
-            senderName = myNameInput,
-            imageData = imageData,
-            thumbnailData = thumbnailData,
-            timestamp = System.currentTimeMillis()
-        )
-        chatMessages.add(msg)
-    }
-
-    private fun onStartDiscovery() {
-        viewModel.startDiscovery()
-    }
-
-    private fun onTakePhoto() {
-        Toast.makeText(this, "Camera integration — requires CameraX permission flow", Toast.LENGTH_SHORT).show()
-        // TODO: Integrate with CameraX for actual photo capture
-        // For now, simulate with a placeholder image
     }
 
     override fun onDestroy() {
         super.onDestroy()
         try {
             unbindService(serviceConnection)
+            isServiceBound = false
         } catch (_: Exception) {}
         viewModel.unbindService(this)
     }

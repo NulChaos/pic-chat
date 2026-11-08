@@ -2,6 +2,7 @@ package com.nulchaos.pichat.viewmodel
 
 import android.content.Context
 import android.content.Intent
+import android.net.wifi.p2p.WifiP2pManager
 import android.net.wifi.p2p.WifiP2pDevice
 import android.util.Log
 import androidx.lifecycle.ViewModel
@@ -15,6 +16,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
@@ -51,53 +53,50 @@ class ChatViewModel(private val context: Context) : ViewModel() {
     private var service: WifiDirectService? = null
     private var isBound = false
 
-    fun bindService(ctx: Context) {
-        if (isBound) return
-        try {
-            val intent = Intent(ctx, WifiDirectService::class.java).apply {
-                setPackage(ctx.packageName)
-            }
-            ctx.bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+    fun bindService(ctx: Context, svc: WifiDirectService? = null) {
+        if (isBound) return  // Already bound, MainActivity handles it
+        if (svc != null) {
+            this.service = svc
             isBound = true
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to bind Wi-Fi Direct service", e)
-            _errorMessage.value = "Failed to start networking service: ${e.message}"
+            observeService()
         }
     }
 
     fun unbindService(ctx: Context) {
         if (!isBound) return
-        try {
-            ctx.unbindService(serviceConnection)
-            isBound = false
-        } catch (_: Exception) {}
+        service = null
+        isBound = false
     }
 
-    private val serviceConnection = object : android.content.ServiceConnection {
-        override fun onServiceConnected(name: android.content.ComponentName?, svc: android.os.Binder?) {
-            service = (svc as WifiDirectService.LocalBinder).getService()
-            observeService()
-        }
 
-        override fun onServiceDisconnected(name: android.content.ComponentName?) {
-            service = null
-        }
+
+    fun startWifiService(ctx: Context) {
+        // Start the WifiDirectService - MainActivity also handles binding in lifecycle
+        try {
+            val intent = Intent(ctx, com.nulchaos.pichat.WifiDirectService::class.java)
+            ctx.startService(intent)
+        } catch (_: Exception) {}
     }
 
     private fun observeService() {
         val svc = service ?: return
 
+        // Observe WiFi state changes via StateFlow collect (needs coroutine flow)
         viewModelScope.launch {
-            service?.wifiState?.collect { state ->
-                _wifiState.value = state
-                if (state == WifiState.HOSTING) {
-                    _errorMessage.value = null
+            service?.wifiState?.let { flow ->
+                flow.collect { state ->
+                    _wifiState.value = state
+                    if (state == WifiState.HOSTING) {
+                        _errorMessage.value = null
+                    }
                 }
             }
         }
 
+        // Observe incoming messages via message channel
         viewModelScope.launch {
-            service?.messageChannel?.receiveCatching()?.collect { msg ->
+            val ch = service?.messageChannel ?: return@launch
+            for (msg in ch) {
                 handleIncomingMessage(msg)
             }
         }
@@ -115,13 +114,10 @@ class ChatViewModel(private val context: Context) : ViewModel() {
         override fun onReceive(ctx: Context?, intent: Intent?) {
             when (intent?.action) {
                 WifiDirectService.ACTION_PEERS_FOUND -> {
-                    // Refresh via service
+                    // Use service's discoveredPeers flow (already filtered)
                     viewModelScope.launch {
                         _discoveredDevices.value = service?.let { s ->
-                            wifiP2pManager.requestPeers(wifiChannel) { peers ->
-                                peers.deviceList.filter { it.deviceName != s.myDeviceName }
-                                    .toList()
-                            }
+                            s.discoveredPeers.value.filter { it.deviceName != s.myDeviceName }
                         } ?: emptyList()
                     }
                 }
@@ -129,12 +125,9 @@ class ChatViewModel(private val context: Context) : ViewModel() {
         }
     }
 
-    // We need a WifiP2pManager for peer refresh
-    private val wifiP2pManager: WifiP2pManager?
-        get() = service?.let { svc ->
-            // Access via reflection or through the service interface
-            null  // Use service's internal manager instead
-        }
+    // Get WifiP2pManager via context getSystemService
+    private fun getP2pManager(): WifiP2pManager? =
+        context.getSystemService(android.content.Context.WIFI_P2P_SERVICE) as? WifiP2pManager
 
     private var _wifiChannel: android.net.wifi.p2p.WifiP2pManager.Channel? = null
     private val wifiChannel: android.net.wifi.p2p.WifiP2pManager.Channel?
@@ -142,7 +135,7 @@ class ChatViewModel(private val context: Context) : ViewModel() {
 
     // Initialize WifiP2pManager channel from service
     fun initWifiP2pChannel(ctx: Context) {
-        _wifiChannel = android.net.wifi.p2p.WifiP2pManager().initialize(
+        _wifiChannel = (ctx.getSystemService(android.content.Context.WIFI_P2P_SERVICE) as android.net.wifi.p2p.WifiP2pManager).initialize(
             ctx,
             android.os.Looper.getMainLooper(),
             null
@@ -288,6 +281,10 @@ class ChatViewModel(private val context: Context) : ViewModel() {
             _errorMessage.value = "Service not bound"
         }
     }
+
+    fun setError(msg: String) {
+            _errorMessage.value = msg
+        }
 
     fun clearError() {
         _errorMessage.update { null }
